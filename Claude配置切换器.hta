@@ -1,0 +1,480 @@
+<!--
+  ==============================================================================
+  Claude Code 配置切换器  v1.0
+  ==============================================================================
+  用途：一键在 Claude Opus 4.8 与 DeepSeek V4 PRO 之间切换 Claude Code 的后端模型。
+  原理：修改 %USERPROFILE%\.claude\settings.json 中的 env 配置，切换后重启 Claude Code 生效。
+
+  技术说明：
+    - 这是一个 Windows HTA（HTML Application），双击即可运行，无需安装任何依赖。
+    - 使用 ActiveX 组件读写本地文件（仅限 Windows，仅操作 settings.json）。
+    - 切换过程采用"备份 → 写入临时文件 → 移动 → 校验 → 失败回滚"的安全五步法。
+
+  安全提示：
+    - 请先在配置区域填入你自己的 API Key，占位符的值无法直接使用。
+    - 切勿将含有真实 Key 的版本提交到 Git 仓库等公开场合。
+  ==============================================================================
+-->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta http-equiv="x-ua-compatible" content="ie=edge">
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>Claude Code 配置切换器</title>
+<!--
+  HTA 应用程序元数据 —— 控制窗口外观与行为
+  - singleinstance: 同一时间只允许打开一个窗口，防止并发写 settings.json 导致数据损坏
+  - contextmenu: 禁用右键菜单，保持工具风格
+  - maximizebutton/minimizebutton: 只允许最小化，不允许最大化
+-->
+<hta:application
+  id="app"
+  applicationname="ClaudeConfigSwitcher"
+  border="thin"
+  borderstyle="normal"
+  caption="yes"
+  maximizebutton="no"
+  minimizebutton="yes"
+  showintaskbar="yes"
+  singleinstance="yes"
+  scroll="no"
+  contextmenu="no"
+  innerborder="no"
+  selection="no"
+/>
+<!--
+  ============================================
+  样式表 —— 暗色主题，模拟专业工具界面
+  - 颜色体系：深色背景 #0f1117，卡片 #161922，绿色(Claude) / 紫色(DeepSeek) 双色区分
+  - 卡片激活态通过 border + box-shadow 高亮，当前已启用的按钮变灰不可点击
+  ============================================
+-->
+<style type="text/css">
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body {
+  width:100%; height:100%;
+  font-family:"Microsoft YaHei","Segoe UI",Tahoma,sans-serif;
+  background:#0f1117;
+  color:#e6e8ee;
+  overflow:hidden;
+  -ms-user-select:none;
+}
+body { padding:16px 20px 12px 20px; }
+
+.hdr { text-align:center; margin-bottom:12px; }
+.hdr h1 { font-size:19px; font-weight:bold; letter-spacing:1px; color:#ffffff; }
+.hdr .sub { font-size:12px; color:#7b8194; margin-top:3px; }
+
+.statusbar { text-align:center; font-size:12px; color:#9aa0b4; margin-bottom:12px; }
+.badge { display:inline-block; padding:3px 12px; border-radius:11px; font-weight:bold; font-size:12px; margin-left:4px; }
+.badge.a { background:#1e3a2f; color:#4ade80; border:1px solid #2f6f50; }
+.badge.b { background:#2a2348; color:#a78bfa; border:1px solid #5b4b9a; }
+.badge.x { background:#3a2a1e; color:#fbbf24; border:1px solid #7a5a2f; }
+
+.cards { width:100%; }
+.card { width:100%; margin-bottom:11px; border:1px solid #262a36; border-radius:12px; background:#161922; padding:13px 15px; position:relative; }
+.card.active-a { border-color:#3ba776; background:#13211b; box-shadow:0 0 0 1px #3ba776; }
+.card.active-b { border-color:#7c5cdb; background:#1a1730; box-shadow:0 0 0 1px #7c5cdb; }
+
+.card .row1 { margin-bottom:7px; }
+.card .name { font-size:15px; font-weight:bold; color:#ffffff; display:inline-block; vertical-align:middle; }
+.card .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:8px; vertical-align:middle; }
+.dot.ca { background:#4ade80; }
+.dot.cb { background:#a78bfa; }
+
+.card .tick { float:right; font-size:12px; font-weight:bold; color:#4ade80; line-height:20px; }
+.card.active-b .tick { color:#a78bfa; }
+
+.meta { font-size:11px; color:#8b91a4; line-height:1.7; }
+.meta b { color:#c4c9d8; font-weight:normal; display:inline-block; width:50px; }
+.meta .val { color:#aeb4c6; }
+.meta .auth { color:#fbbf24; }
+
+.btn { display:block; width:100%; margin-top:9px; padding:8px 0; text-align:center; cursor:pointer; border-radius:8px; font-size:13px; font-weight:bold; border:1px solid #2f3340; background:#1d2230; color:#cfd4e2; }
+.btn.ba { background:#1e6f4d; border-color:#27885e; color:#eafff5; }
+.btn.bb { background:#5a45a8; border-color:#6e57c4; color:#f3efff; }
+.btn.cur { background:#20242f; border-color:#2a2f3c; color:#5e6478; cursor:default; }
+
+.foot { text-align:center; font-size:11px; color:#5b6072; margin-top:4px; line-height:1.6; }
+.foot a { color:#7b8aa8; text-decoration:none; cursor:pointer; }
+.foot a:hover { color:#9fb0d0; text-decoration:underline; }
+
+#toast { position:absolute; left:50%; top:50%; width:320px; margin-left:-160px; margin-top:-40px; background:#1b2030; border:1px solid #34c07a; border-radius:10px; padding:16px 18px; text-align:center; font-size:13px; color:#eafff5; display:none; z-index:50; }
+#toast.err { border-color:#e0556b; color:#ffe9ec; }
+#toast .t-title { font-size:14px; font-weight:bold; margin-bottom:6px; }
+#mask { position:absolute; left:0; top:0; width:100%; height:100%; background:#000; filter:alpha(opacity=45); opacity:0.45; display:none; z-index:40; }
+</style>
+</head>
+<!--
+  ============================================
+  页面结构 —— 三部分组成
+  1. 头部标题：Claude Code 配置切换器
+  2. 两张配置卡片：方案 A（Claude / b.ai）与 方案 B（DeepSeek / 官方 API）
+  3. 底部操作栏：切换提示 + 快速打开 .claude 目录链接
+  ============================================
+-->
+<body>
+
+<div class="hdr">
+  <h1>Claude Code 配置切换器</h1>
+  <div class="sub">一键在 Claude Opus 4.8 与 DeepSeek V4 PRO 之间无缝切换</div>
+</div>
+
+<div class="statusbar">
+  当前激活：<span id="curBadge" class="badge x">检测中…</span>
+</div>
+
+<div class="cards">
+  <div id="cardA" class="card">
+    <div class="row1">
+      <span class="dot ca"></span>
+      <span class="name">Claude Opus 4.8</span>
+      <span id="tickA" class="tick"></span>
+    </div>
+    <div class="meta">
+      <div><b>模型</b><span class="val">claude-opus-4.8</span></div>
+      <div><b>线路</b><span class="val">https://api.b.ai（中转站）</span></div>
+      <div><b>鉴权</b><span class="val">API_KEY <span id="keyA"></span></span></div>
+    </div>
+    <div id="btnA" class="btn ba" onclick="onSwitch('A')">切换到 Claude</div>
+  </div>
+
+  <div id="cardB" class="card">
+    <div class="row1">
+      <span class="dot cb"></span>
+      <span class="name">DeepSeek V4 PRO</span>
+      <span id="tickB" class="tick"></span>
+    </div>
+    <div class="meta">
+      <div><b>模型</b><span class="val">deepseek-v4-pro[1m]　·　子代理 deepseek-v4-flash</span></div>
+      <div><b>线路</b><span class="val">https://api.deepseek.com/anthropic（官方）</span></div>
+      <div><b>鉴权</b><span class="auth">AUTH_TOKEN <span id="keyB"></span></span></div>
+    </div>
+    <div id="btnB" class="btn bb" onclick="onSwitch('B')">切换到 DeepSeek</div>
+  </div>
+</div>
+
+<div class="foot">
+  切换后需<b style="color:#9aa0b4">重启 Claude Code 会话</b>才生效 &nbsp;·&nbsp;
+  <a onclick="openFolder()">打开 .claude 目录</a>
+</div>
+
+<div id="mask"></div>
+<div id="toast"><div class="t-title" id="toastTitle"></div><div id="toastBody"></div></div>
+
+<!--
+  ============================================
+  JavaScript 核心逻辑
+  流程概述：
+  1. 读取 %USERPROFILE%\.claude\settings.json
+  2. 检测当前使用的是哪套配置（通过 ANTHROPIC_BASE_URL 判断）
+  3. 用户点击切换 → 备份原文件 → 整体替换 env → 写入 → 校验 → 失败则回滚
+  4. 刷新界面，提示用户重启 Claude Code
+  ============================================
+-->
+<script language="javascript">
+/*
+ * JSON 对象由 HTA 运行时（IE8+）原生提供，无需 polyfill。
+ * 此处不引入任何自定义 JSON 实现，避免 eval() 等安全隐患。
+ */
+
+/* ====== 1. 配置定义 —— 使用前请修改以下两个 Key 为你自己的！ ====== */
+/*
+ * 每套配置包含：
+ *   name     - 在界面上显示的名称
+ *   showKey  - 在界面上脱敏显示的 Key（只展示前 6 + 后 4 位）
+ *   env      - 完整的环境变量集合，切换时会整体替换 settings.json 中的 env 对象
+ *
+ * 修改说明：
+ *   1. 找到下面 "在此填入你的xxx" 占位符，替换成你自己的真实 Key
+ *   2. 如果使用其他中转站，同步修改 ANTHROPIC_BASE_URL
+ *   3. 可以调整 MAX_THINKING_TOKENS / CLAUDE_CODE_EFFORT_LEVEL 等参数
+ *
+ * 方案 A 使用 ANTHROPIC_API_KEY 鉴权（b.ai 中转站要求）
+ * 方案 B 使用 ANTHROPIC_AUTH_TOKEN 鉴权（DeepSeek 官方 Anthropic 兼容接口要求）
+ */
+var CFG = {
+  A: {
+    name: "Claude Opus 4.8",
+    showKey: "在此填入你的b.ai_API_Key",
+    env: {
+      ANTHROPIC_API_KEY: "在此填入你的b.ai_API_Key",
+      ANTHROPIC_BASE_URL: "https://api.b.ai",
+      ANTHROPIC_MODEL: "claude-opus-4.8",
+      MAX_THINKING_TOKENS: "0",
+      DISABLE_INTERLEAVED_THINKING: "1"
+    }
+  },
+  B: {
+    name: "DeepSeek V4 PRO",
+    showKey: "在此填入你的DeepSeek密钥",
+    env: {
+      ANTHROPIC_BASE_URL: "https://api.deepseek.com/anthropic",
+      ANTHROPIC_AUTH_TOKEN: "在此填入你的DeepSeek密钥",
+      ANTHROPIC_MODEL: "deepseek-v4-pro[1m]",
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek-v4-pro[1m]",
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "deepseek-v4-pro[1m]",
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: "deepseek-v4-flash",
+      CLAUDE_CODE_SUBAGENT_MODEL: "deepseek-v4-flash",
+      CLAUDE_CODE_EFFORT_LEVEL: "max"
+    }
+  }
+};
+function cloneEnv(which) { return JSON.parse(JSON.stringify(CFG[which].env)); }
+var DEFAULT_OBJ = { env: cloneEnv("A"), theme: "dark" };
+
+/* ====== 2. 文件路径 —— 操作对象：%USERPROFILE%\.claude\settings.json ====== */
+// .bak 是切换前的备份，.tmp 是写入过程中的临时文件
+function settingsPath() {
+  var sh = new ActiveXObject("WScript.Shell");
+  var home = sh.ExpandEnvironmentStrings("%USERPROFILE%");
+  return home + "\\.claude\\settings.json";
+}
+// 带时间戳的备份路径，每次切换生成独立备份，不会覆盖历史
+function bakPath() {
+  var d = new Date();
+  var pad = function(n){ return (n<10?"0":"")+n; };
+  var ts = d.getFullYear() + pad(d.getMonth()+1) + pad(d.getDate())
+         + "_" + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
+  return settingsPath() + ".bak." + ts;
+}
+// 查找最新的备份文件（用于回滚）
+function latestBak() {
+  var fso = new ActiveXObject("Scripting.FileSystemObject");
+  var dir = fso.GetParentFolderName(settingsPath());
+  var name = settingsPath().split("\\").pop();
+  var prefix = name + ".bak.";
+  var best = null, bestTime = "";
+  try {
+    var folder = fso.GetFolder(dir);
+    var fc = new Enumerator(folder.Files);
+    for (; !fc.atEnd(); fc.moveNext()) {
+      var fn = fc.item().Name;
+      if (fn.indexOf(prefix) === 0) {
+        var t = fn.substr(prefix.length);
+        if (t > bestTime) { bestTime = t; best = fc.item().Path; }
+      }
+    }
+  } catch(e) {}
+  return best;
+}
+function tmpPath() { return settingsPath() + ".tmp"; }
+
+/* ====== 3. UTF-8 文件读写（无 BOM） ====== */
+/*
+ * HTA 用 ADODB.Stream 操作文件流。
+ * writeUtf8NoBom 的实现方式：先以 UTF-8 文本模式写入，再切换到二进制模式
+ * 跳过前 3 字节的 BOM 头（0xEF 0xBB 0xBF），实现无 BOM 输出。
+ * 这对 settings.json 至关重要 —— 带 BOM 可能导致 Claude Code 解析失败。
+ */
+function readUtf8(path) {
+  var fso = new ActiveXObject("Scripting.FileSystemObject");
+  if (!fso.FileExists(path)) { return null; }
+  var s = new ActiveXObject("ADODB.Stream");
+  s.Type = 2; s.Charset = "utf-8"; s.Open();
+  s.LoadFromFile(path);
+  var txt = s.ReadText();
+  s.Close();
+  if (txt.length > 0 && txt.charCodeAt(0) === 0xFEFF) { txt = txt.substr(1); }
+  return txt;
+}
+function writeUtf8NoBom(path, text) {
+  var s = new ActiveXObject("ADODB.Stream");
+  s.Type = 2; s.Charset = "utf-8"; s.Open();
+  s.WriteText(text);
+  s.Position = 0;
+  s.Type = 1;
+  s.Position = 3;
+  var bin = s.Read();
+  s.Close();
+  var out = new ActiveXObject("ADODB.Stream");
+  out.Type = 1; out.Open();
+  out.Write(bin);
+  out.SaveToFile(path, 2);
+  out.Close();
+}
+function copyFile(src, dst) {
+  var fso = new ActiveXObject("Scripting.FileSystemObject");
+  if (fso.FileExists(src)) { fso.CopyFile(src, dst, true); return true; }
+  return false;
+}
+// 注意：tmp 和 settings.json 在同一 NTFS 卷上，MoveFile 是原子操作，可直接覆盖，无需先删
+function moveOver(src, dst) {
+  var fso = new ActiveXObject("Scripting.FileSystemObject");
+  fso.MoveFile(src, dst);
+}
+
+/* ====== 4. 读取 settings.json（损坏则用默认值兜底） ====== */
+// 如果文件不存在、内容为空、或 JSON 解析失败，返回一个安全的默认配置对象
+function cloneDefault() { return JSON.parse(JSON.stringify(DEFAULT_OBJ)); }
+function loadSettings() {
+  var raw = readUtf8(settingsPath());
+  if (raw === null) { return cloneDefault(); }
+  try {
+    var obj = JSON.parse(raw);
+    if (!obj || typeof obj !== "object") { return cloneDefault(); }
+    return obj;
+  } catch (e) { return cloneDefault(); }
+}
+
+/* ====== 5. 检测当前激活的配置方案 ====== */
+// 通过检查 ANTHROPIC_BASE_URL 来判断：含 "api.b.ai" → A，含 "deepseek.com" → B，都不是 → 未知
+function detectActive() {
+  var raw = readUtf8(settingsPath());
+  if (raw === null) { return "?"; }
+  try {
+    var obj = JSON.parse(raw);
+    var url = obj && obj.env ? ("" + obj.env.ANTHROPIC_BASE_URL) : "";
+    if (url.indexOf("api.b.ai") >= 0) { return "A"; }
+    if (url.indexOf("deepseek.com") >= 0) { return "B"; }
+    return "?";
+  } catch (e) { return "?"; }
+}
+
+/* ====== 6. 核心：应用配置 —— 五步安全写入法 ====== */
+/*
+ * 步骤说明：
+ *   (1) 备份    settings.json → settings.json.bak
+ *   (2) 写入    新内容 → settings.json.tmp（临时文件，写入失败不影响原文件）
+ *   (3) 移动    settings.json.tmp → settings.json（原子替换，覆盖原文件）
+ *   (4) 校验    重新读取并对比关键字段（BASE_URL + Key），确保写入完整
+ *   (5) 回滚    校验失败时从 .bak 恢复，抛出异常提示用户
+ *
+ * 采用"整体替换 env"策略而非逐 Key 合并，彻底杜绝两套配置的变量互相残留。
+ */
+function applyConfig(which) {
+  var sp = settingsPath();
+  var fso = new ActiveXObject("Scripting.FileSystemObject");
+
+  var obj = loadSettings();
+  obj.env = cloneEnv(which);   /* 整体替换，杜绝两套变量互相残留 */
+
+  var newText = JSON.stringify(obj, null, 2);
+
+  if (fso.FileExists(sp)) {
+    try { copyFile(sp, bakPath()); }
+    catch (eBak) { throw new Error("备份失败，已中止，未改动原文件。"); }
+  }
+
+  try { writeUtf8NoBom(tmpPath(), newText); }
+  catch (eTmp) { throw new Error("写入临时文件失败：" + eTmp.message); }
+
+  try { moveOver(tmpPath(), sp); }
+  catch (eMv) {
+    try { if (fso.FileExists(tmpPath())) fso.DeleteFile(tmpPath(), true); } catch (e2) {}
+    // Step (5) 回滚：移动失败时尝试从最近备份恢复，避免 settings.json 丢失
+    var restore = latestBak();
+    if (restore) { try { copyFile(restore, sp); } catch (eR) {} }
+    throw new Error("替换主文件失败，已尝试从上次备份恢复。技术信息：" + eMv.message);
+  }
+
+  /*
+   * (4) 校验：重新读取文件，将写回的 env 与预期 env 做整体比对。
+   *     使用 JSON.stringify 而非逐字段检查，确保所有字段（包括子代理模型、
+   *     EFFORT_LEVEL 等 7 个字段）都被验证，任何一个写入损坏都会被捕获。
+   */
+  var verifyRaw = readUtf8(sp);
+  var ok = false;
+  try {
+    var v = JSON.parse(verifyRaw);
+    var expectedEnv = JSON.stringify(CFG[which].env);
+    var actualEnv   = JSON.stringify(v && v.env ? v.env : {});
+    ok = (expectedEnv === actualEnv);
+  } catch (eV) { ok = false; }
+
+  if (!ok) {
+    var restore = latestBak();
+    if (restore) { try { copyFile(restore, sp); } catch (eR) {} }
+    throw new Error("校验失败，已从最近备份回滚。请重试。");
+  }
+  return true;
+}
+
+/* ====== 7. UI 渲染与交互 ====== */
+/*
+ * mask4()   — 脱敏显示 Key：仅展示前 6 位 + … + 后 4 位
+ * render()  — 刷新界面：检测当前配置 → 高亮对应卡片 → 更新按钮状态
+ * onSwitch()— 切换响应：防重复点击 → applyConfig → 弹窗提示结果
+ * showToast()— 自定义弹窗：替代 alert，支持成功/错误两种样式
+ * openFolder()— 用资源管理器打开 .claude 目录，方便手动检查或编辑
+ */
+function mask4(k) {
+  if (!k || k.length < 10) { return "（未设置）"; }
+  return k.substr(0, 6) + "…" + k.substr(k.length - 4);
+}
+function $(id) { return document.getElementById(id); }
+
+function render() {
+  $("keyA").innerHTML = mask4(CFG.A.showKey);
+  $("keyB").innerHTML = mask4(CFG.B.showKey);
+
+  var active = detectActive();
+  var badge = $("curBadge");
+  var cardA = $("cardA"), cardB = $("cardB");
+  var tickA = $("tickA"), tickB = $("tickB");
+  var btnA = $("btnA"), btnB = $("btnB");
+
+  cardA.className = "card"; cardB.className = "card";
+  tickA.innerHTML = ""; tickB.innerHTML = "";
+  btnA.className = "btn ba"; btnB.className = "btn bb";
+  btnA.innerHTML = "切换到 Claude"; btnB.innerHTML = "切换到 DeepSeek";
+
+  if (active === "A") {
+    badge.className = "badge a"; badge.innerHTML = "Claude Opus 4.8";
+    cardA.className = "card active-a"; tickA.innerHTML = "● 使用中";
+    btnA.className = "btn cur"; btnA.innerHTML = "当前已启用";
+  } else if (active === "B") {
+    badge.className = "badge b"; badge.innerHTML = "DeepSeek V4 PRO";
+    cardB.className = "card active-b"; tickB.innerHTML = "● 使用中";
+    btnB.className = "btn cur"; btnB.innerHTML = "当前已启用";
+  } else {
+    badge.className = "badge x"; badge.innerHTML = "自定义 / 未知";
+  }
+}
+
+var busy = false;
+function onSwitch(which) {
+  if (busy) { return; }
+  if (detectActive() === which) { return; }
+  busy = true;
+  try {
+    applyConfig(which);
+    showToast(false, "切换成功", "已切换到 " + CFG[which].name + "。<br>请<b>完全退出并重启 Claude Code</b> 后生效。");
+  } catch (e) {
+    showToast(true, "切换失败", (e && e.message) ? e.message : "未知错误");
+  } finally {
+    render();
+    busy = false;
+  }
+}
+
+function showToast(isErr, title, body) {
+  var t = $("toast"), m = $("mask");
+  t.className = isErr ? "err" : "";
+  $("toastTitle").innerHTML = title;
+  $("toastBody").innerHTML = body;
+  m.style.display = "block";
+  t.style.display = "block";
+  window.setTimeout(hideToast, isErr ? 4500 : 3000);
+}
+function hideToast() {
+  $("toast").style.display = "none";
+  $("mask").style.display = "none";
+}
+
+function openFolder() {
+  try {
+    var sh = new ActiveXObject("WScript.Shell");
+    var home = sh.ExpandEnvironmentStrings("%USERPROFILE%");
+    sh.Run("explorer.exe \"" + home + "\\.claude\"", 1, false);
+  } catch (e) {}
+}
+
+window.onload = function () {
+  try { window.resizeTo(620, 560); } catch (e) {}
+  try { window.moveTo((screen.availWidth - 620) / 2, (screen.availHeight - 560) / 2); } catch (e) {}
+  render();
+};
+</script>
+</body>
+</html>
